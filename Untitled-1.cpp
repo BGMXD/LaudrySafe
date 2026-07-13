@@ -5,7 +5,7 @@
 
 // --- Konfigurasi Pin ---
 #define VIB_PIN 15       // Pin Sensor Getaran SW420 terhubung ke D15
-#define DHTPIN 5         // Pin Sensor Suhu DHT22 terhubung ke D5
+#define DHTPIN 4         // Pin Sensor Suhu DHT22 terhubung ke D4 
 #define DHTTYPE DHT22    // Tipe Sensor DHT (DHT22)
 
 // --- Konfigurasi OLED ---
@@ -17,6 +17,11 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 DHT dht(DHTPIN, DHTTYPE);
 
+// --- Variabel Baru untuk Logika Debounce 2 Arah ---
+int hitungAnomali = 0;        // Penghitung berapa kali sensor mendeteksi getaran (1)
+int hitungAman = 0;           // Penghitung berapa kali sensor mendeteksi diam (0)
+bool statusAnomali = false;   // Status akhir yang akan ditampilkan di layar
+
 void setup() {
   Serial.begin(115200);
 
@@ -26,7 +31,7 @@ void setup() {
   // Inisialisasi Sensor DHT
   dht.begin();
 
-  // Inisialisasi Komunikasi I2C untuk OLED (Pin D21 SDA, D22 SCL otomatis di ESP32)
+  // Inisialisasi Komunikasi I2C untuk OLED (Pin D21 SDA, D22 SCL)
   Wire.begin();
 
   // Inisialisasi Layar OLED (Alamat I2C umumnya 0x3C)
@@ -50,8 +55,29 @@ void loop() {
   float suhu = dht.readTemperature();
   
   // 2. Membaca Status Getaran dari SW420
-  // SW420 umumnya membaca HIGH (1) saat mendeteksi getaran kuat
+  // (Asumsi standar: HIGH/1 = Ada Getaran, LOW/0 = Diam/Aman)
   int statusGetaran = digitalRead(VIB_PIN);
+
+  // --- LOGIKA FILTER GETARAN (DEBOUNCE 2 ARAH) ---
+  if (statusGetaran == HIGH) {
+    hitungAnomali++;     // Tambah terus poin anomali
+    hitungAman = 0;      // Reset poin aman menjadi 0
+
+    if (hitungAnomali >= 5) {
+      statusAnomali = true; // Ubah layar ke Anomali setelah 5x beruntun
+      hitungAnomali = 5;    // Tahan angka di 5 agar tidak membebani memori (overflow)
+    }
+  } 
+  else { 
+    // Jika sensor mendeteksi LOW (0)
+    hitungAman++;        // Tambah terus poin aman
+    hitungAnomali = 0;   // Reset poin anomali menjadi 0
+
+    if (hitungAman >= 7) {
+      statusAnomali = false; // Ubah layar ke Aman setelah 7x beruntun
+      hitungAman = 7;        // Tahan angka di 7 agar tidak membebani memori
+    }
+  }
 
   // Validasi pembacaan DHT22 (mencegah error jika sensor terputus)
   if (isnan(suhu)) {
@@ -59,14 +85,16 @@ void loop() {
     suhu = 0.0; // Mengubah nilai menjadi 0 jika error
   }
 
-  // 3. Menampilkan Data ke Serial Monitor (Untuk proses debugging)
+  // 3. Menampilkan Data ke Serial Monitor
   Serial.print("Suhu: "); 
   Serial.print(suhu); 
   Serial.print(" *C | Getaran: ");
-  if (statusGetaran == HIGH) {
-    Serial.println("TERDETEKSI!");
+  
+  // Menampilkan ke Serial berdasarkan variabel filter
+  if (statusAnomali == true) {
+    Serial.println("TERDETEKSI! (Anomali)");
   } else {
-    Serial.println("Normal");
+    Serial.println("Normal (Aman)");
   }
 
   // 4. Menampilkan Data ke Layar OLED
@@ -76,20 +104,22 @@ void loop() {
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print("Suhu Mesin: ");
-  display.print(suhu, 1); // Menampilkan 1 angka di belakang koma
+  display.print(suhu, 1); 
   display.print(" C");
 
   // Baris 2: Menampilkan Status Getaran
   display.setCursor(0, 16);
   display.print("Getaran   : ");
-  if (statusGetaran == HIGH) {
-    display.print("ANOMALI!");
+  
+  // Menampilkan ke OLED berdasarkan variabel filter
+  if (statusAnomali == true) {
+    display.print("ANOMALI!!!!");
   } else {
     display.print("Aman");
   }
 
-  display.display(); // Eksekusi perintah untuk menampilkan ke layar
+  display.display(); 
 
-  // Jeda 1 detik sebelum sistem melakukan pembacaan ulang
-  delay(1000); 
+  // Jeda 100ms sebelum sistem melakukan pembacaan ulang
+  delay(100); 
 }
