@@ -8,15 +8,9 @@
 const char* ssid = "NAMA_WIFI_ANDA";
 const char* password = "PASSWORD_WIFI_ANDA";
 
-// Atur IP Static yang diinginkan (Sesuaikan dengan segmen IP Router Anda)
-IPAddress local_IP(192, 168, 1, 200); 
-IPAddress gateway(192, 168, 1, 1);    
-IPAddress subnet(255, 255, 255, 0);   
-IPAddress primaryDNS(8, 8, 8, 8);     
-
 // --- Konfigurasi Port Server (TCP/IP) ---
-WiFiServer server(8080); // Port 8080 sangat optimal untuk socket IoT
-WiFiClient vbClient;     // Variabel penyimpan koneksi Visual Basic
+WiFiServer server(8080); 
+WiFiClient vbClient;     
 
 // --- Konfigurasi Pin ---
 #define VIB_PIN 15       
@@ -31,38 +25,35 @@ WiFiClient vbClient;     // Variabel penyimpan koneksi Visual Basic
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 DHT dht(DHTPIN, DHTTYPE);
 
-// --- Variabel Debounce 2 Arah & Timer ---
+// --- Variabel Logika ---
 int hitungAnomali = 0;        
 int hitungAman = 0;           
 bool statusAnomali = false;   
 float suhu = 0.0;
 unsigned long waktuKirimTerakhir = 0;
+unsigned long waktuKedipTerakhir = 0;
+bool statusKedipLayar = false;
 
 // ==========================================
 // ASET IKON (BITMAP 8x8 PIXEL)
 // ==========================================
-// 1. Ikon WiFi Terhubung (Sinyal Gelombang)
-const unsigned char icon_wifi_ok[] PROGMEM = {
-  0x00, 0x3c, 0x42, 0x81, 0x00, 0x24, 0x00, 0x18
-};
-// 2. Ikon WiFi Terputus (Tanda Silang X)
-const unsigned char icon_wifi_off[] PROGMEM = {
-  0x81, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x81
-};
-// 3. Ikon VB Terhubung (Teks "VB" Kecil)
-const unsigned char icon_vb_ok[] PROGMEM = {
-  0x00, 0xac, 0xaa, 0xac, 0x4a, 0x4c, 0x00, 0x00
-};
-// 4. Ikon VB Terputus (Teks "VB" Dicoret Silang)
-const unsigned char icon_vb_off[] PROGMEM = {
-  0x81, 0x6c, 0x3a, 0x1c, 0x0a, 0x4c, 0x80, 0x00
-};
+const unsigned char icon_wifi_ok[] PROGMEM = { 0x00, 0x3c, 0x42, 0x81, 0x00, 0x24, 0x00, 0x18 };
+const unsigned char icon_wifi_off[] PROGMEM = { 0x81, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x81 };
+const unsigned char icon_vb_ok[] PROGMEM = { 0x00, 0xac, 0xaa, 0xac, 0x4a, 0x4c, 0x00, 0x00 };
+const unsigned char icon_vb_off[] PROGMEM = { 0x81, 0x6c, 0x3a, 0x1c, 0x0a, 0x4c, 0x80, 0x00 };
+
+// Ikon Api (Panas)
+const unsigned char icon_api[] PROGMEM = { 0x08, 0x1c, 0x2a, 0x5d, 0x55, 0x49, 0x22, 0x0c };
+// Ikon Daun (Segar)
+const unsigned char icon_daun[] PROGMEM = { 0x02, 0x06, 0x0e, 0x1c, 0x38, 0x70, 0x20, 0x00 };
 
 void setup() {
   Serial.begin(115200);
   
   pinMode(VIB_PIN, INPUT);
   dht.begin();
+  
+  // Menggunakan jalur I2C Default ESP32: D21 (SDA) dan D22 (SCL)
   Wire.begin();
 
   if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
@@ -74,48 +65,53 @@ void setup() {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
   display.setCursor(0, 10);
-  display.print("Setup IP Static...");
+  display.print("Koneksi WiFi...");
   display.display();
 
-  // Konfigurasi IP Static
-  if (!WiFi.config(local_IP, gateway, subnet, primaryDNS)) {
-    Serial.println("Gagal mengonfigurasi IP Static");
+  // 1. Mulai koneksi WiFi (DHCP)
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
   }
 
-  WiFi.begin(ssid, password);
+  // 2. Ambil data Gateway otomatis dari Router
+  IPAddress autoGateway = WiFi.gatewayIP();
+  IPAddress autoSubnet = WiFi.subnetMask();
+  IPAddress autoDNS = WiFi.dnsIP();
+
+  // 3. Buat IP Static dinamis berakhiran .200
+  IPAddress local_IP(autoGateway[0], autoGateway[1], autoGateway[2], 200);
+  WiFi.config(local_IP, autoGateway, autoSubnet, autoDNS);
 
   // Mulai Server TCP
   server.begin(); 
-  Serial.println("Server TCP dimulai pada port 8080");
+  Serial.println("\nIP Address (Static): " + WiFi.localIP().toString());
 }
 
 void loop() {
-  // 1. Cek Status Koneksi WiFi
+  // 1. Cek Koneksi WiFi & VB
   bool wifiTersambung = (WiFi.status() == WL_CONNECTED);
 
-  // 2. Cek & Kelola Koneksi dari Visual Basic
   if (server.hasClient()) {
-    // Jika ada klien baru yang mencoba masuk
     if (!vbClient || !vbClient.connected()) {
-      if (vbClient) vbClient.stop(); // Tutup koneksi lama (jika ada *hang*)
-      vbClient = server.available(); // Terima koneksi dari VB
-      Serial.println("Visual Basic TERHUBUNG!");
+      if (vbClient) vbClient.stop(); 
+      vbClient = server.available(); 
     } else {
-      // Tolak koneksi klien lain jika VB sudah terhubung (1 server 1 klien)
       WiFiClient tolakKlien = server.available();
       tolakKlien.stop();
     }
   }
+  bool vbTersambung = (vbClient && vbClient.connected());
 
-  // 3. Membaca Data Sensor
+  // 2. Membaca Sensor
   float bacaSuhu = dht.readTemperature();
-  if (!isnan(bacaSuhu)) {
-    suhu = bacaSuhu; 
-  }
+  if (!isnan(bacaSuhu)) suhu = bacaSuhu; 
   
-  int statusGetaran = digitalRead(VIB_PIN);
+  bool bahayaSuhu = (suhu > 40.0); // True jika suhu lebih dari 40
 
   // Logika Filter Getaran (Debounce)
+  int statusGetaran = digitalRead(VIB_PIN);
   if (statusGetaran == HIGH) {
     hitungAnomali++;     
     hitungAman = 0;      
@@ -126,57 +122,68 @@ void loop() {
     if (hitungAman >= 7) { statusAnomali = false; hitungAman = 7; }
   }
 
-  // 4. Kirim Data ke Visual Basic (Setiap 1 Detik)
-  // Format data: "SUHU,STATUS_GETARAN" -> Contoh: "45.2,ANOMALI"
+  // 3. Kondisi Kritis (Keduanya Bahaya) -> Layar Berkedip 1000ms
+  bool kondisiKritis = (bahayaSuhu && statusAnomali);
+  
+  if (kondisiKritis) {
+    if (millis() - waktuKedipTerakhir >= 1000) {
+      waktuKedipTerakhir = millis();
+      statusKedipLayar = !statusKedipLayar;
+      display.invertDisplay(statusKedipLayar); // Membalik warna layar (Hitam jadi putih)
+    }
+  } else {
+    // Kembalikan layar ke normal jika tidak kritis
+    display.invertDisplay(false); 
+  }
+
+  // 4. Kirim Data ke Visual Basic (Format: SUHU,STATUS_SUHU,STATUS_GETARAN)
   if (millis() - waktuKirimTerakhir >= 1000) {
     waktuKirimTerakhir = millis();
     
-    if (vbClient && vbClient.connected()) {
-      String dataPaket = String(suhu, 1) + ",";
-      dataPaket += (statusAnomali) ? "ANOMALI" : "AMAN";
+    if (vbTersambung) {
+      String dataSuhu = bahayaSuhu ? "PANAS BERBAHAYA" : "UDARA SEGAR";
+      String dataGetaran = statusAnomali ? "GETARAN BERANOMALI" : "GETARAN AMAN";
       
-      vbClient.println(dataPaket); // Kirim ke VB
+      String dataPaket = String(suhu, 1) + "," + dataSuhu + "," + dataGetaran;
+      vbClient.println(dataPaket); 
     }
   }
 
-  // 5. Menggambar Tampilan Layar OLED
+  // 5. Menggambar Layar OLED (Layout 3 Baris)
   display.clearDisplay();
   
-  // -- Bagian Teks (Suhu dan Getaran) --
+  // Baris 1 (Suhu & Ikon Sinyal) - Posisi Y: 0
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print("Suhu: ");
   display.print(suhu, 1); 
   display.print("C");
 
-  display.setCursor(0, 16);
-  display.print("Vib : ");
-  if (statusAnomali == true) {
-    display.print("ANOMALI!");
+  if (vbTersambung) display.drawBitmap(106, 0, icon_vb_ok, 8, 8, SSD1306_WHITE);
+  else display.drawBitmap(106, 0, icon_vb_off, 8, 8, SSD1306_WHITE);
+
+  if (wifiTersambung) display.drawBitmap(118, 0, icon_wifi_ok, 8, 8, SSD1306_WHITE);
+  else display.drawBitmap(118, 0, icon_wifi_off, 8, 8, SSD1306_WHITE);
+
+  // Baris 2 (Indikator Teks Suhu & Emoji) - Posisi Y: 12
+  if (bahayaSuhu) {
+    display.drawBitmap(0, 12, icon_api, 8, 8, SSD1306_WHITE);
+    display.setCursor(12, 12);
+    display.print("Panas Berbahaya");
   } else {
-    display.print("Aman");
+    display.drawBitmap(0, 12, icon_daun, 8, 8, SSD1306_WHITE);
+    display.setCursor(12, 12);
+    display.print("Udara Segar");
   }
 
-  // -- Bagian Ikon Status Kanan Atas --
-  // Parameter drawBitmap: (X, Y, nama_bitmap, lebar, tinggi, warna)
-  
-  // Cek Status VB
-  bool vbTersambung = (vbClient && vbClient.connected());
-
-  // Gambar Ikon VB (Posisi X: 106, Y: 0)
-  if (vbTersambung) {
-    display.drawBitmap(106, 0, icon_vb_ok, 8, 8, SSD1306_WHITE);
+  // Baris 3 (Indikator Teks Getaran) - Posisi Y: 24
+  display.setCursor(0, 24);
+  if (statusAnomali) {
+    display.print("Getaran Beranomali");
   } else {
-    display.drawBitmap(106, 0, icon_vb_off, 8, 8, SSD1306_WHITE);
-  }
-
-  // Gambar Ikon WiFi (Posisi X: 118, Y: 0) Paling ujung kanan
-  if (wifiTersambung) {
-    display.drawBitmap(118, 0, icon_wifi_ok, 8, 8, SSD1306_WHITE);
-  } else {
-    display.drawBitmap(118, 0, icon_wifi_off, 8, 8, SSD1306_WHITE);
+    display.print("Getaran Aman");
   }
 
   display.display(); 
-  delay(100); 
+  delay(100); // Waktu respons sensor 0.1 detik
 }
