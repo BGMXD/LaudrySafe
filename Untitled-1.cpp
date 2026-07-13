@@ -1,189 +1,295 @@
-#include <WiFi.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_SSD1306.h>
-#include <DHT.h>
+Imports System.Net.Sockets
+Imports System.IO
+Imports System.Data.SQLite
+Imports System.Runtime.InteropServices ' Digunakan untuk pemutar MP3
 
-// --- Konfigurasi WiFi & IP Static ---
-const char* ssid = "NAMA_WIFI_ANDA";
-const char* password = "PASSWORD_WIFI_ANDA";
+Public Class Form1
+    ' ==========================================
+    ' DEKLARASI VARIABEL GLOBAL
+    ' ==========================================
+    ' Variabel untuk Koneksi TCP
+    Private client As TcpClient
+    Private reader As StreamReader
+    Private isConnected As Boolean = False
 
-// --- Konfigurasi Port Server (TCP/IP) ---
-WiFiServer server(8080); 
-WiFiClient vbClient;     
-
-// --- Konfigurasi Pin ---
-#define VIB_PIN 15       
-#define DHTPIN 4         
-#define DHTTYPE DHT22    
-
-// --- Konfigurasi OLED ---
-#define SCREEN_WIDTH 128 
-#define SCREEN_HEIGHT 32 
-#define OLED_RESET    -1 
-
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
-DHT dht(DHTPIN, DHTTYPE);
-
-// --- Variabel Logika ---
-int hitungAnomali = 0;        
-int hitungAman = 0;           
-bool statusAnomali = false;   
-float suhu = 0.0;
-unsigned long waktuKirimTerakhir = 0;
-unsigned long waktuKedipTerakhir = 0;
-bool statusKedipLayar = false;
-
-// ==========================================
-// ASET IKON (BITMAP 8x8 PIXEL)
-// ==========================================
-const unsigned char icon_wifi_ok[] PROGMEM = { 0x00, 0x3c, 0x42, 0x81, 0x00, 0x24, 0x00, 0x18 };
-const unsigned char icon_wifi_off[] PROGMEM = { 0x81, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x81 };
-const unsigned char icon_vb_ok[] PROGMEM = { 0x00, 0xac, 0xaa, 0xac, 0x4a, 0x4c, 0x00, 0x00 };
-const unsigned char icon_vb_off[] PROGMEM = { 0x81, 0x6c, 0x3a, 0x1c, 0x0a, 0x4c, 0x80, 0x00 };
-
-// Ikon Api (Panas)
-const unsigned char icon_api[] PROGMEM = { 0x08, 0x1c, 0x2a, 0x5d, 0x55, 0x49, 0x22, 0x0c };
-// Ikon Daun (Segar)
-const unsigned char icon_daun[] PROGMEM = { 0x02, 0x06, 0x0e, 0x1c, 0x38, 0x70, 0x20, 0x00 };
-
-void setup() {
-  Serial.begin(115200);
-  
-  pinMode(VIB_PIN, INPUT);
-  dht.begin();
-  
-  // Menggunakan jalur I2C Default ESP32: D21 (SDA) dan D22 (SCL)
-  Wire.begin();
-
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("Gagal inisialisasi OLED!"));
-    for(;;); 
-  }
-
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 10);
-  display.print("Koneksi WiFi...");
-  display.display();
-
-  // 1. Mulai koneksi WiFi (DHCP)
-  WiFi.begin(ssid, password);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-
-  // 2. Ambil data Gateway otomatis dari Router
-  IPAddress autoGateway = WiFi.gatewayIP();
-  IPAddress autoSubnet = WiFi.subnetMask();
-  IPAddress autoDNS = WiFi.dnsIP();
-
-  // 3. Buat IP Static dinamis berakhiran .200
-  IPAddress local_IP(autoGateway[0], autoGateway[1], autoGateway[2], 200);
-  WiFi.config(local_IP, autoGateway, autoSubnet, autoDNS);
-
-  // Mulai Server TCP
-  server.begin(); 
-  Serial.println("\nIP Address (Static): " + WiFi.localIP().toString());
-}
-
-void loop() {
-  // 1. Cek Koneksi WiFi & VB
-  bool wifiTersambung = (WiFi.status() == WL_CONNECTED);
-
-  if (server.hasClient()) {
-    if (!vbClient || !vbClient.connected()) {
-      if (vbClient) vbClient.stop(); 
-      vbClient = server.available(); 
-    } else {
-      WiFiClient tolakKlien = server.available();
-      tolakKlien.stop();
-    }
-  }
-  bool vbTersambung = (vbClient && vbClient.connected());
-
-  // 2. Membaca Sensor
-  float bacaSuhu = dht.readTemperature();
-  if (!isnan(bacaSuhu)) suhu = bacaSuhu; 
-  
-  bool bahayaSuhu = (suhu > 40.0); // True jika suhu lebih dari 40
-
-  // Logika Filter Getaran (Debounce)
-  int statusGetaran = digitalRead(VIB_PIN);
-  if (statusGetaran == HIGH) {
-    hitungAnomali++;     
-    hitungAman = 0;      
-    if (hitungAnomali >= 5) { statusAnomali = true; hitungAnomali = 5; }
-  } else { 
-    hitungAman++;        
-    hitungAnomali = 0;   
-    if (hitungAman >= 7) { statusAnomali = false; hitungAman = 7; }
-  }
-
-  // 3. Kondisi Kritis (Keduanya Bahaya) -> Layar Berkedip 1000ms
-  bool kondisiKritis = (bahayaSuhu && statusAnomali);
-  
-  if (kondisiKritis) {
-    if (millis() - waktuKedipTerakhir >= 1000) {
-      waktuKedipTerakhir = millis();
-      statusKedipLayar = !statusKedipLayar;
-      display.invertDisplay(statusKedipLayar); // Membalik warna layar (Hitam jadi putih)
-    }
-  } else {
-    // Kembalikan layar ke normal jika tidak kritis
-    display.invertDisplay(false); 
-  }
-
-  // 4. Kirim Data ke Visual Basic (Format: SUHU,STATUS_SUHU,STATUS_GETARAN)
-  if (millis() - waktuKirimTerakhir >= 1000) {
-    waktuKirimTerakhir = millis();
+    ' Variabel Database SQLite
+    Private dbConnection As String = "Data Source=history_anomali.db;Version=3;"
     
-    if (vbTersambung) {
-      String dataSuhu = bahayaSuhu ? "PANAS BERBAHAYA" : "UDARA SEGAR";
-      String dataGetaran = statusAnomali ? "GETARAN BERANOMALI" : "GETARAN AMAN";
-      
-      String dataPaket = String(suhu, 1) + "," + dataSuhu + "," + dataGetaran;
-      vbClient.println(dataPaket); 
-    }
-  }
+    ' Variabel Logika (Mencegah Spam DB & Audio)
+    Private statusSedangAnomali As Boolean = False
+    Private isLaguDiputar As Boolean = False
 
-  // 5. Menggambar Layar OLED (Layout 3 Baris)
-  display.clearDisplay();
-  
-  // Baris 1 (Suhu & Ikon Sinyal) - Posisi Y: 0
-  display.setTextSize(1);
-  display.setCursor(0, 0);
-  display.print("Suhu: ");
-  display.print(suhu, 1); 
-  display.print("C");
+    ' ==========================================
+    ' FUNGSI PEMUTAR MP3 (WINDOWS API)
+    ' ==========================================
+    <DllImport("winmm.dll")>
+    Private Shared Function mciSendString(ByVal command As String, ByVal buffer As String, ByVal bufferSize As Integer, ByVal hwndCallback As IntPtr) As Integer
+    End Function
 
-  if (vbTersambung) display.drawBitmap(106, 0, icon_vb_ok, 8, 8, SSD1306_WHITE);
-  else display.drawBitmap(106, 0, icon_vb_off, 8, 8, SSD1306_WHITE);
+    Private Sub PutarMP3(pathLagu As String)
+        mciSendString("close laguAlarm", Nothing, 0, IntPtr.Zero) ' Tutup lagu sebelumnya
+        mciSendString("open """ & pathLagu & """ type mpegvideo alias laguAlarm", Nothing, 0, IntPtr.Zero)
+        mciSendString("play laguAlarm", Nothing, 0, IntPtr.Zero)
+    End Sub
 
-  if (wifiTersambung) display.drawBitmap(118, 0, icon_wifi_ok, 8, 8, SSD1306_WHITE);
-  else display.drawBitmap(118, 0, icon_wifi_off, 8, 8, SSD1306_WHITE);
+    Private Sub HentikanMP3()
+        mciSendString("close laguAlarm", Nothing, 0, IntPtr.Zero)
+    End Sub
 
-  // Baris 2 (Indikator Teks Suhu & Emoji) - Posisi Y: 12
-  if (bahayaSuhu) {
-    display.drawBitmap(0, 12, icon_api, 8, 8, SSD1306_WHITE);
-    display.setCursor(12, 12);
-    display.print("Panas Berbahaya");
-  } else {
-    display.drawBitmap(0, 12, icon_daun, 8, 8, SSD1306_WHITE);
-    display.setCursor(12, 12);
-    display.print("Udara Segar");
-  }
+    ' ==========================================
+    ' EVENT FORM LOAD (Awal Aplikasi Dibuka)
+    ' ==========================================
+    Private Sub Form1_Load(sender As Object, e As EventArgs) Handles MyBase.Load
+        TerapkanTemaModern()      ' 1. Ubah desain ke Dark Mode
+        BuatDatabaseDanTabel()    ' 2. Buat database SQLite jika belum ada
+        TampilkanHistory()        ' 3. Tampilkan riwayat lama ke layar
+    End Sub
 
-  // Baris 3 (Indikator Teks Getaran) - Posisi Y: 24
-  display.setCursor(0, 24);
-  if (statusAnomali) {
-    display.print("Getaran Beranomali");
-  } else {
-    display.print("Getaran Aman");
-  }
 
-  display.display(); 
-  delay(100); // Waktu respons sensor 0.1 detik
-}
+    ' ==========================================
+    ' BAGIAN 1: DATABASE SQLITE
+    ' ==========================================
+    Private Sub BuatDatabaseDanTabel()
+        If Not File.Exists("history_anomali.db") Then
+            SQLiteConnection.CreateFile("history_anomali.db")
+        End If
+
+        Using conn As New SQLiteConnection(dbConnection)
+            conn.Open()
+            Dim query As String = "CREATE TABLE IF NOT EXISTS TabelAnomali (ID INTEGER PRIMARY KEY AUTOINCREMENT, Tanggal TEXT, Waktu TEXT, Suhu TEXT, Keterangan TEXT)"
+            Using cmd As New SQLiteCommand(query, conn)
+                cmd.ExecuteNonQuery()
+            End Using
+        End Using
+    End Sub
+
+    Private Sub SimpanAnomali(suhuTercatat As String, keteranganBahaya As String)
+        Dim tglSekarang As String = DateTime.Now.ToString("dd/MM/yyyy")
+        Dim waktuSekarang As String = DateTime.Now.ToString("HH:mm:ss")
+
+        Using conn As New SQLiteConnection(dbConnection)
+            conn.Open()
+            Dim query As String = "INSERT INTO TabelAnomali (Tanggal, Waktu, Suhu, Keterangan) VALUES (@tgl, @waktu, @suhu, @ket)"
+            Using cmd As New SQLiteCommand(query, conn)
+                cmd.Parameters.AddWithValue("@tgl", tglSekarang)
+                cmd.Parameters.AddWithValue("@waktu", waktuSekarang)
+                cmd.Parameters.AddWithValue("@suhu", suhuTercatat)
+                cmd.Parameters.AddWithValue("@ket", keteranganBahaya)
+                cmd.ExecuteNonQuery()
+            End Using
+        End Using
+
+        TampilkanHistory() ' Refresh tabel di layar
+    End Sub
+
+    Private Sub TampilkanHistory()
+        Using conn As New SQLiteConnection(dbConnection)
+            conn.Open()
+            Dim query As String = "SELECT Tanggal, Waktu, Suhu, Keterangan FROM TabelAnomali ORDER BY ID DESC"
+            Dim adapter As New SQLiteDataAdapter(query, conn)
+            Dim tabelData As New DataTable()
+            adapter.Fill(tabelData)
+
+            dgvHistory.DataSource = tabelData
+            dgvHistory.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
+        End Using
+    End Sub
+
+    Private Sub btnHapusRiwayat_Click(sender As Object, e As EventArgs) Handles btnHapusRiwayat.Click
+        Dim konfirmasi As DialogResult = MessageBox.Show(
+            "Apakah Anda yakin ingin menghapus SEMUA data riwayat anomali mesin cuci?" & vbCrLf & "Data yang sudah dihapus tidak dapat dikembalikan!", 
+            "Peringatan Hapus Data", MessageBoxButtons.YesNo, MessageBoxIcon.Warning)
+
+        If konfirmasi = DialogResult.Yes Then
+            Try
+                Using conn As New SQLiteConnection(dbConnection)
+                    conn.Open()
+                    ' Hapus isi tabel
+                    Using cmd As New SQLiteCommand("DELETE FROM TabelAnomali;", conn)
+                        cmd.ExecuteNonQuery()
+                    End Using
+                    ' Reset nomor urut (ID) kembali ke 1
+                    Using cmdReset As New SQLiteCommand("DELETE FROM sqlite_sequence WHERE name='TabelAnomali';", conn)
+                        cmdReset.ExecuteNonQuery()
+                    End Using
+                End Using
+
+                MessageBox.Show("Seluruh riwayat anomali berhasil dibersihkan.", "Sukses", MessageBoxButtons.OK, MessageBoxIcon.Information)
+                TampilkanHistory()
+
+            Catch ex As Exception
+                MessageBox.Show("Terjadi kesalahan saat menghapus data: " & ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error)
+            End Try
+        End If
+    End Sub
+
+
+    ' ==========================================
+    ' BAGIAN 2: KONEKSI TCP KE ESP32
+    ' ==========================================
+    Private Async Sub btnConnect_Click(sender As Object, e As EventArgs) Handles btnConnect.Click
+        If isConnected Then
+            isConnected = False
+            If client IsNot Nothing Then client.Close()
+            lblStatusKoneksi.Text = "Status: Terputus"
+            lblStatusKoneksi.ForeColor = Color.White
+            btnConnect.Text = "Hubungkan"
+            Return
+        End If
+
+        Try
+            lblStatusKoneksi.Text = "Status: Mencari ESP32..."
+            btnConnect.Enabled = False
+
+            client = New TcpClient()
+            Await client.ConnectAsync(txtIP.Text, 8080) ' Hubungkan ke Port 8080
+            
+            reader = New StreamReader(client.GetStream())
+            isConnected = True
+            
+            lblStatusKoneksi.Text = "Status: TERHUBUNG"
+            lblStatusKoneksi.ForeColor = Color.FromArgb(40, 167, 69) ' Hijau
+            btnConnect.Text = "Putuskan Koneksi"
+            btnConnect.Enabled = True
+
+            MulaiBacaData()
+
+        Catch ex As Exception
+            MessageBox.Show("Gagal terhubung! Pastikan ESP32 menyala dan IP benar." & vbCrLf & ex.Message, "Error Koneksi", MessageBoxButtons.OK, MessageBoxIcon.Error)
+            lblStatusKoneksi.Text = "Status: Terputus"
+            btnConnect.Enabled = True
+        End Try
+    End Sub
+
+    Private Async Sub MulaiBacaData()
+        Try
+            While isConnected AndAlso client.Connected
+                Dim dataMasuk As String = Await reader.ReadLineAsync()
+                
+                If dataMasuk IsNot Nothing Then
+                    ProsesDataSensor(dataMasuk)
+                End If
+            End While
+        Catch ex As Exception
+            isConnected = False
+            lblStatusKoneksi.Text = "Status: Terputus (Koneksi Hilang)"
+            lblStatusKoneksi.ForeColor = Color.FromArgb(220, 53, 69) ' Merah
+            btnConnect.Text = "Hubungkan"
+            HentikanMP3() ' Matikan lagu jika ESP32 tiba-tiba mati
+        End Try
+    End Sub
+
+
+    ' ==========================================
+    ' BAGIAN 3: LOGIKA PEMROSESAN DATA & ALARM
+    ' ==========================================
+    Private Sub ProsesDataSensor(dataKasar As String)
+        ' Pecah data berformat: "45.2,PANAS BERBAHAYA,GETARAN BERANOMALI"
+        Dim paket() As String = dataKasar.Split(","c)
+        
+        If paket.Length = 3 Then
+            Dim nilaiSuhu As String = paket(0)
+            Dim statusSuhu As String = paket(1)
+            Dim statusGetaran As String = paket(2)
+
+            ' Update UI Label
+            lblSuhuAngka.Text = nilaiSuhu & " °C"
+            lblSuhuStatus.Text = statusSuhu
+            lblGetaranStatus.Text = statusGetaran
+
+            lblSuhuStatus.ForeColor = If(statusSuhu.Contains("BAHAYA"), Color.FromArgb(220, 53, 69), Color.FromArgb(40, 167, 69))
+            lblGetaranStatus.ForeColor = If(statusGetaran.Contains("ANOMALI"), Color.FromArgb(220, 53, 69), Color.FromArgb(40, 167, 69))
+
+            ' Cek Status Kritis
+            Dim adaBahaya As Boolean = statusSuhu.Contains("BAHAYA") OrElse statusGetaran.Contains("ANOMALI")
+            Dim kritisKeduanya As Boolean = statusSuhu.Contains("BAHAYA") AndAlso statusGetaran.Contains("ANOMALI")
+
+            ' 1. Logika Audio (Rickroll)
+            If kritisKeduanya = True AndAlso isLaguDiputar = False Then
+                PutarMP3("E:\Visual Studio\repos\Bahaya_MesinCuci_Project_IoT\Rickroll Meme Template.mp3")
+                isLaguDiputar = True
+            ElseIf kritisKeduanya = False AndAlso isLaguDiputar = True Then
+                HentikanMP3()
+                isLaguDiputar = False
+            End If
+
+            ' 2. Logika Database
+            If adaBahaya = True Then
+                If statusSedangAnomali = False Then
+                    Dim keteranganBahaya As String = ""
+                    If statusSuhu.Contains("BAHAYA") AndAlso statusGetaran.Contains("ANOMALI") Then
+                        keteranganBahaya = "Suhu & Getaran Kritis"
+                    ElseIf statusSuhu.Contains("BAHAYA") Then
+                        keteranganBahaya = "Overheating (Suhu Tinggi)"
+                    ElseIf statusGetaran.Contains("ANOMALI") Then
+                        keteranganBahaya = "Getaran Kasar (Beban Unbalance)"
+                    End If
+
+                    SimpanAnomali(nilaiSuhu, keteranganBahaya)
+                    statusSedangAnomali = True 
+                End If
+            Else
+                ' Jika aman, reset status pencatatan DB
+                statusSedangAnomali = False
+            End If
+        End If
+    End Sub
+
+
+    ' ==========================================
+    ' BAGIAN 4: SUNTIKAN TEMA MODERN DARK MODE
+    ' ==========================================
+    Private Sub TerapkanTemaModern()
+        Me.BackColor = Color.FromArgb(30, 30, 30)
+        Me.ForeColor = Color.White
+        Me.Font = New Font("Segoe UI", 10, FontStyle.Regular)
+        Me.Text = "LaundrySafe Dashboard - Monitor Mesin Cuci"
+
+        btnConnect.FlatStyle = FlatStyle.Flat
+        btnConnect.FlatAppearance.BorderSize = 0
+        btnConnect.BackColor = Color.FromArgb(0, 122, 204)
+        btnConnect.ForeColor = Color.White
+        btnConnect.Font = New Font("Segoe UI", 10, FontStyle.Bold)
+        btnConnect.Cursor = Cursors.Hand
+
+        btnHapusRiwayat.FlatStyle = FlatStyle.Flat
+        btnHapusRiwayat.FlatAppearance.BorderSize = 0
+        btnHapusRiwayat.BackColor = Color.FromArgb(220, 53, 69)
+        btnHapusRiwayat.ForeColor = Color.White
+        btnHapusRiwayat.Font = New Font("Segoe UI", 10, FontStyle.Bold)
+        btnHapusRiwayat.Cursor = Cursors.Hand
+
+        txtIP.BackColor = Color.FromArgb(45, 45, 48)
+        txtIP.ForeColor = Color.White
+        txtIP.BorderStyle = BorderStyle.FixedSingle
+        txtIP.Font = New Font("Segoe UI", 11, FontStyle.Regular)
+
+        With dgvHistory
+            .BackgroundColor = Color.FromArgb(45, 45, 48) 
+            .BorderStyle = BorderStyle.None
+            .EnableHeadersVisualStyles = False 
+            
+            .ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None
+            .ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(37, 37, 38)
+            .ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(0, 122, 204)
+            .ColumnHeadersDefaultCellStyle.Font = New Font("Segoe UI", 10, FontStyle.Bold)
+            .ColumnHeadersHeight = 35
+            
+            .DefaultCellStyle.BackColor = Color.FromArgb(45, 45, 48)
+            .DefaultCellStyle.ForeColor = Color.White
+            .DefaultCellStyle.SelectionBackColor = Color.FromArgb(0, 122, 204) 
+            .DefaultCellStyle.SelectionForeColor = Color.White
+            
+            .RowHeadersVisible = False 
+            .AllowUserToAddRows = False 
+            .GridColor = Color.FromArgb(60, 60, 60) 
+            .AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill 
+            .SelectionMode = DataGridViewSelectionMode.FullRowSelect 
+        End With
+
+        lblSuhuAngka.Font = New Font("Segoe UI", 36, FontStyle.Bold)
+        lblSuhuStatus.Font = New Font("Segoe UI", 14, FontStyle.Bold)
+        lblGetaranStatus.Font = New Font("Segoe UI", 14, FontStyle.Bold)
+    End Sub
+
+End Class
