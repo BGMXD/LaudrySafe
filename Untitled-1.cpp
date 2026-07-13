@@ -1,295 +1,278 @@
-Imports System.Net.Sockets
-Imports System.IO
-Imports System.Data.SQLite
-Imports System.Runtime.InteropServices ' Digunakan untuk pemutar MP3
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <WebServer.h>
+#include <Adafruit_VL53L0X.h>
 
-Public Class Form1
-    ' ==========================================
-    ' DEKLARASI VARIABEL GLOBAL
-    ' ==========================================
-    ' Variabel untuk Koneksi TCP
-    Private client As TcpClient
-    Private reader As StreamReader
-    Private isConnected As Boolean = False
+// --- Konfigurasi WiFi ---
+const char* ssid = "Radot.Net";
+const char* password = "radothome";
 
-    ' Variabel Database SQLite
-    Private dbConnection As String = "Data Source=history_anomali.db;Version=3;"
-    
-    ' Variabel Logika (Mencegah Spam DB & Audio)
-    Private statusSedangAnomali As Boolean = False
-    Private isLaguDiputar As Boolean = False
+// --- Batas Bahaya ---
+const float BATAS_SUHU_KRITIS = 28.1; 
 
-    ' ==========================================
-    ' FUNGSI PEMUTAR MP3 (WINDOWS API)
-    ' ==========================================
-    <DllImport("winmm.dll")>
-    Private Shared Function mciSendString(ByVal command As String, ByVal buffer As String, ByVal bufferSize As Integer, ByVal hwndCallback As IntPtr) As Integer
-    End Function
+// --- Konfigurasi Server ---
+WiFiServer serverTCP(8080); 
+WiFiClient vbClient;     
+WebServer serverWeb(80);    
 
-    Private Sub PutarMP3(pathLagu As String)
-        mciSendString("close laguAlarm", Nothing, 0, IntPtr.Zero) ' Tutup lagu sebelumnya
-        mciSendString("open """ & pathLagu & """ type mpegvideo alias laguAlarm", Nothing, 0, IntPtr.Zero)
-        mciSendString("play laguAlarm", Nothing, 0, IntPtr.Zero)
-    End Sub
+// --- Konfigurasi Pin Sensor Lainnya ---
+#define VIB_PIN 15       
+#define DHTPIN 4         
+#define DHTTYPE DHT22    
 
-    Private Sub HentikanMP3()
-        mciSendString("close laguAlarm", Nothing, 0, IntPtr.Zero)
-    End Sub
+// --- KONFIGURASI DUAL I2C (OLED vs VL53L0X) ---
+#define SENSOR_SDA 16    // Pin SDA khusus untuk VL53L0X
+#define SENSOR_SCL 17    // Pin SCL khusus untuk VL53L0X
 
-    ' ==========================================
-    ' EVENT FORM LOAD (Awal Aplikasi Dibuka)
-    ' ==========================================
-    Private Sub Form1_Load(sender As Object, e As EventArgs) Handles MyBase.Load
-        TerapkanTemaModern()      ' 1. Ubah desain ke Dark Mode
-        BuatDatabaseDanTabel()    ' 2. Buat database SQLite jika belum ada
-        TampilkanHistory()        ' 3. Tampilkan riwayat lama ke layar
-    End Sub
+// Membuat jalur I2C kedua (I2C1) khusus untuk sensor jarak
+TwoWire I2C_VL53L0X = TwoWire(1); 
 
+// --- Konfigurasi OLED ---
+#define SCREEN_WIDTH 128 
+#define SCREEN_HEIGHT 32 
+#define OLED_RESET    -1 
 
-    ' ==========================================
-    ' BAGIAN 1: DATABASE SQLITE
-    ' ==========================================
-    Private Sub BuatDatabaseDanTabel()
-        If Not File.Exists("history_anomali.db") Then
-            SQLiteConnection.CreateFile("history_anomali.db")
-        End If
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+DHT dht(DHTPIN, DHTTYPE);
+Adafruit_VL53L0X lox = Adafruit_VL53L0X(); 
 
-        Using conn As New SQLiteConnection(dbConnection)
-            conn.Open()
-            Dim query As String = "CREATE TABLE IF NOT EXISTS TabelAnomali (ID INTEGER PRIMARY KEY AUTOINCREMENT, Tanggal TEXT, Waktu TEXT, Suhu TEXT, Keterangan TEXT)"
-            Using cmd As New SQLiteCommand(query, conn)
-                cmd.ExecuteNonQuery()
-            End Using
-        End Using
-    End Sub
+// --- Variabel Logika Sensor ---
+int hitungAnomali = 0;        
+int hitungAman = 0;           
+bool statusAnomali = false;   
+float suhu = 0.0;
+unsigned long waktuKedipTerakhir = 0;
+bool statusKedipLayar = false;
 
-    Private Sub SimpanAnomali(suhuTercatat As String, keteranganBahaya As String)
-        Dim tglSekarang As String = DateTime.Now.ToString("dd/MM/yyyy")
-        Dim waktuSekarang As String = DateTime.Now.ToString("HH:mm:ss")
+// --- Variabel Hasil Akhir Jarak ---
+int jarakRataRata = 0; 
 
-        Using conn As New SQLiteConnection(dbConnection)
-            conn.Open()
-            Dim query As String = "INSERT INTO TabelAnomali (Tanggal, Waktu, Suhu, Keterangan) VALUES (@tgl, @waktu, @suhu, @ket)"
-            Using cmd As New SQLiteCommand(query, conn)
-                cmd.Parameters.AddWithValue("@tgl", tglSekarang)
-                cmd.Parameters.AddWithValue("@waktu", waktuSekarang)
-                cmd.Parameters.AddWithValue("@suhu", suhuTercatat)
-                cmd.Parameters.AddWithValue("@ket", keteranganBahaya)
-                cmd.ExecuteNonQuery()
-            End Using
-        End Using
+// ==========================================
+// ASET IKON OLED (BITMAP 8x8 PIXEL)
+// ==========================================
+const unsigned char icon_wifi_ok[] PROGMEM = { 0x00, 0x3c, 0x42, 0x81, 0x00, 0x24, 0x00, 0x18 };
+const unsigned char icon_wifi_off[] PROGMEM = { 0x81, 0x42, 0x24, 0x18, 0x18, 0x24, 0x42, 0x81 };
+const unsigned char icon_vb_ok[] PROGMEM = { 0x00, 0xac, 0xaa, 0xac, 0x4a, 0x4c, 0x00, 0x00 };
+const unsigned char icon_vb_off[] PROGMEM = { 0x81, 0x6c, 0x3a, 0x1c, 0x0a, 0x4c, 0x80, 0x00 };
+const unsigned char icon_api[] PROGMEM = { 0x08, 0x1c, 0x2a, 0x5d, 0x55, 0x49, 0x22, 0x0c };
+const unsigned char icon_daun[] PROGMEM = { 0x02, 0x06, 0x0e, 0x1c, 0x38, 0x70, 0x20, 0x00 };
 
-        TampilkanHistory() ' Refresh tabel di layar
-    End Sub
-
-    Private Sub TampilkanHistory()
-        Using conn As New SQLiteConnection(dbConnection)
-            conn.Open()
-            Dim query As String = "SELECT Tanggal, Waktu, Suhu, Keterangan FROM TabelAnomali ORDER BY ID DESC"
-            Dim adapter As New SQLiteDataAdapter(query, conn)
-            Dim tabelData As New DataTable()
-            adapter.Fill(tabelData)
-
-            dgvHistory.DataSource = tabelData
-            dgvHistory.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill
-        End Using
-    End Sub
-
-    Private Sub btnHapusRiwayat_Click(sender As Object, e As EventArgs) Handles btnHapusRiwayat.Click
-        Dim konfirmasi As DialogResult = MessageBox.Show(
-            "Apakah Anda yakin ingin menghapus SEMUA data riwayat anomali mesin cuci?" & vbCrLf & "Data yang sudah dihapus tidak dapat dikembalikan!", 
-            "Peringatan Hapus Data", MessageBoxButtons.YesNo, MessageBoxIcon.Warning)
-
-        If konfirmasi = DialogResult.Yes Then
-            Try
-                Using conn As New SQLiteConnection(dbConnection)
-                    conn.Open()
-                    ' Hapus isi tabel
-                    Using cmd As New SQLiteCommand("DELETE FROM TabelAnomali;", conn)
-                        cmd.ExecuteNonQuery()
-                    End Using
-                    ' Reset nomor urut (ID) kembali ke 1
-                    Using cmdReset As New SQLiteCommand("DELETE FROM sqlite_sequence WHERE name='TabelAnomali';", conn)
-                        cmdReset.ExecuteNonQuery()
-                    End Using
-                End Using
-
-                MessageBox.Show("Seluruh riwayat anomali berhasil dibersihkan.", "Sukses", MessageBoxButtons.OK, MessageBoxIcon.Information)
-                TampilkanHistory()
-
-            Catch ex As Exception
-                MessageBox.Show("Terjadi kesalahan saat menghapus data: " & ex.Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Error)
-            End Try
-        End If
-    End Sub
-
-
-    ' ==========================================
-    ' BAGIAN 2: KONEKSI TCP KE ESP32
-    ' ==========================================
-    Private Async Sub btnConnect_Click(sender As Object, e As EventArgs) Handles btnConnect.Click
-        If isConnected Then
-            isConnected = False
-            If client IsNot Nothing Then client.Close()
-            lblStatusKoneksi.Text = "Status: Terputus"
-            lblStatusKoneksi.ForeColor = Color.White
-            btnConnect.Text = "Hubungkan"
-            Return
-        End If
-
-        Try
-            lblStatusKoneksi.Text = "Status: Mencari ESP32..."
-            btnConnect.Enabled = False
-
-            client = New TcpClient()
-            Await client.ConnectAsync(txtIP.Text, 8080) ' Hubungkan ke Port 8080
-            
-            reader = New StreamReader(client.GetStream())
-            isConnected = True
-            
-            lblStatusKoneksi.Text = "Status: TERHUBUNG"
-            lblStatusKoneksi.ForeColor = Color.FromArgb(40, 167, 69) ' Hijau
-            btnConnect.Text = "Putuskan Koneksi"
-            btnConnect.Enabled = True
-
-            MulaiBacaData()
-
-        Catch ex As Exception
-            MessageBox.Show("Gagal terhubung! Pastikan ESP32 menyala dan IP benar." & vbCrLf & ex.Message, "Error Koneksi", MessageBoxButtons.OK, MessageBoxIcon.Error)
-            lblStatusKoneksi.Text = "Status: Terputus"
-            btnConnect.Enabled = True
-        End Try
-    End Sub
-
-    Private Async Sub MulaiBacaData()
-        Try
-            While isConnected AndAlso client.Connected
-                Dim dataMasuk As String = Await reader.ReadLineAsync()
-                
-                If dataMasuk IsNot Nothing Then
-                    ProsesDataSensor(dataMasuk)
-                End If
-            End While
-        Catch ex As Exception
-            isConnected = False
-            lblStatusKoneksi.Text = "Status: Terputus (Koneksi Hilang)"
-            lblStatusKoneksi.ForeColor = Color.FromArgb(220, 53, 69) ' Merah
-            btnConnect.Text = "Hubungkan"
-            HentikanMP3() ' Matikan lagu jika ESP32 tiba-tiba mati
-        End Try
-    End Sub
-
-
-    ' ==========================================
-    ' BAGIAN 3: LOGIKA PEMROSESAN DATA & ALARM
-    ' ==========================================
-    Private Sub ProsesDataSensor(dataKasar As String)
-        ' Pecah data berformat: "45.2,PANAS BERBAHAYA,GETARAN BERANOMALI"
-        Dim paket() As String = dataKasar.Split(","c)
+// ==========================================
+// DESAIN HALAMAN WEB SMARTPHONE
+// ==========================================
+const char html_halaman_web[] PROGMEM = R"=====(
+<!DOCTYPE html>
+<html>
+<head>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>LaundrySafe IoT</title>
+  <style>
+    body { background-color: #1e1e1e; color: #ffffff; font-family: 'Segoe UI', Tahoma, sans-serif; text-align: center; margin: 0; padding: 20px; }
+    .card { background-color: #2d2d30; border-radius: 12px; padding: 30px 20px; margin: 5vh auto; max-width: 400px; box-shadow: 0 8px 16px rgba(0,0,0,0.5); }
+    h1 { font-size: 22px; color: #007acc; margin-top: 0; margin-bottom: 20px; letter-spacing: 1px; }
+    .temp { font-size: 55px; font-weight: bold; margin: 10px 0; color: #ffc107; }
+    .dist { font-size: 28px; font-weight: bold; margin: 10px 0; color: #17a2b8; }
+    .status { font-size: 18px; font-weight: bold; margin: 12px 0; padding: 10px; border-radius: 6px; border: 1px solid transparent; }
+    .safe { background-color: rgba(40, 167, 69, 0.1); color: #28a745; border-color: #28a745; }
+    .danger { background-color: rgba(220, 53, 69, 0.1); color: #dc3545; border-color: #dc3545; }
+    .footer { font-size: 12px; color: #666; margin-top: 20px; }
+  </style>
+  <script>
+    setInterval(function() {
+      fetch('/data').then(response => response.json()).then(data => {
+        document.getElementById('suhu-angka').innerText = data.suhu + " °C";
+        document.getElementById('jarak-angka').innerText = "Jarak Lantai: " + data.jarak + " mm";
         
-        If paket.Length = 3 Then
-            Dim nilaiSuhu As String = paket(0)
-            Dim statusSuhu As String = paket(1)
-            Dim statusGetaran As String = paket(2)
+        var elSuhu = document.getElementById('status-suhu');
+        elSuhu.innerText = data.statusSuhu;
+        elSuhu.className = "status " + (data.statusSuhu.includes("BAHAYA") ? "danger" : "safe");
+        
+        var elGetaran = document.getElementById('status-getaran');
+        elGetaran.innerText = data.statusGetar;
+        elGetaran.className = "status " + (data.statusGetar.includes("ANOMALI") ? "danger" : "safe");
+      });
+    }, 1000);
+  </script>
+</head>
+<body>
+  <div class="card">
+    <h1>PANEL MESIN CUCI</h1>
+    <div id="suhu-angka" class="temp">--.- °C</div>
+    <div id="jarak-angka" class="dist">Jarak: -- mm</div>
+    <div id="status-suhu" class="status safe">Memuat Data...</div>
+    <div id="status-getaran" class="status safe">Memuat Data...</div>
+    <div class="footer">Real-Time IoT Monitor</div>
+  </div>
+</body>
+</html>
+)=====";
 
-            ' Update UI Label
-            lblSuhuAngka.Text = nilaiSuhu & " °C"
-            lblSuhuStatus.Text = statusSuhu
-            lblGetaranStatus.Text = statusGetaran
+// Routing Web Server
+void handleRoot() { serverWeb.send(200, "text/html", html_halaman_web); }
+void handleData() {
+  bool bahayaSuhu = (suhu > BATAS_SUHU_KRITIS);
+  String json = "{";
+  json += "\"suhu\":" + String(suhu, 1) + ",";
+  json += "\"jarak\":" + String(jarakRataRata) + ",";
+  json += "\"statusSuhu\":\"" + String(bahayaSuhu ? "PANAS BERBAHAYA" : "UDARA SEGAR") + "\",";
+  json += "\"statusGetar\":\"" + String(statusAnomali ? "GETARAN BERANOMALI" : "GETARAN AMAN") + "\"";
+  json += "}";
+  serverWeb.send(200, "application/json", json);
+}
 
-            lblSuhuStatus.ForeColor = If(statusSuhu.Contains("BAHAYA"), Color.FromArgb(220, 53, 69), Color.FromArgb(40, 167, 69))
-            lblGetaranStatus.ForeColor = If(statusGetaran.Contains("ANOMALI"), Color.FromArgb(220, 53, 69), Color.FromArgb(40, 167, 69))
+// ==========================================
+// PROGRAM UTAMA SETUP
+// ==========================================
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(VIB_PIN, INPUT);
+  dht.begin();
+  
+  // 1. Memulai I2C Pertama (Default Wire) untuk OLED -> D21 (SDA), D22 (SCL)
+  Wire.begin(); 
+  
+  // 2. Memulai I2C Kedua (Wire1) untuk VL53L0X -> D16 (SDA), D17 (SCL)
+  I2C_VL53L0X.begin(SENSOR_SDA, SENSOR_SCL); 
 
-            ' Cek Status Kritis
-            Dim adaBahaya As Boolean = statusSuhu.Contains("BAHAYA") OrElse statusGetaran.Contains("ANOMALI")
-            Dim kritisKeduanya As Boolean = statusSuhu.Contains("BAHAYA") AndAlso statusGetaran.Contains("ANOMALI")
+  // Inisialisasi OLED
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("Gagal inisialisasi OLED!"));
+    for(;;); 
+  }
 
-            ' 1. Logika Audio (Rickroll)
-            If kritisKeduanya = True AndAlso isLaguDiputar = False Then
-                PutarMP3("E:\Visual Studio\repos\Bahaya_MesinCuci_Project_IoT\Rickroll Meme Template.mp3")
-                isLaguDiputar = True
-            ElseIf kritisKeduanya = False AndAlso isLaguDiputar = True Then
-                HentikanMP3()
-                isLaguDiputar = False
-            End If
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.print("Inisialisasi...");
+  display.display();
 
-            ' 2. Logika Database
-            If adaBahaya = True Then
-                If statusSedangAnomali = False Then
-                    Dim keteranganBahaya As String = ""
-                    If statusSuhu.Contains("BAHAYA") AndAlso statusGetaran.Contains("ANOMALI") Then
-                        keteranganBahaya = "Suhu & Getaran Kritis"
-                    ElseIf statusSuhu.Contains("BAHAYA") Then
-                        keteranganBahaya = "Overheating (Suhu Tinggi)"
-                    ElseIf statusGetaran.Contains("ANOMALI") Then
-                        keteranganBahaya = "Getaran Kasar (Beban Unbalance)"
-                    End If
+  // Inisialisasi VL53L0X menggunakan jalur I2C Kedua (&I2C_VL53L0X)
+  if (!lox.begin(0x29, false, &I2C_VL53L0X)) {
+    Serial.println(F("Gagal mendeteksi VL53L0X! Cek kabel di pin 16 dan 17."));
+    display.setCursor(0, 12);
+    display.print("Error VL53L0X!");
+    display.display();
+    while(1);
+  }
 
-                    SimpanAnomali(nilaiSuhu, keteranganBahaya)
-                    statusSedangAnomali = True 
-                End If
-            Else
-                ' Jika aman, reset status pencatatan DB
-                statusSedangAnomali = False
-            End If
-        End If
-    End Sub
+  // Koneksi WiFi
+  display.setCursor(0, 12);
+  display.print("Koneksi WiFi...");
+  display.display();
 
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
 
-    ' ==========================================
-    ' BAGIAN 4: SUNTIKAN TEMA MODERN DARK MODE
-    ' ==========================================
-    Private Sub TerapkanTemaModern()
-        Me.BackColor = Color.FromArgb(30, 30, 30)
-        Me.ForeColor = Color.White
-        Me.Font = New Font("Segoe UI", 10, FontStyle.Regular)
-        Me.Text = "LaundrySafe Dashboard - Monitor Mesin Cuci"
+  IPAddress autoGateway = WiFi.gatewayIP();
+  IPAddress local_IP(autoGateway[0], autoGateway[1], autoGateway[2], 200);
+  WiFi.config(local_IP, autoGateway, WiFi.subnetMask(), WiFi.dnsIP());
 
-        btnConnect.FlatStyle = FlatStyle.Flat
-        btnConnect.FlatAppearance.BorderSize = 0
-        btnConnect.BackColor = Color.FromArgb(0, 122, 204)
-        btnConnect.ForeColor = Color.White
-        btnConnect.Font = New Font("Segoe UI", 10, FontStyle.Bold)
-        btnConnect.Cursor = Cursors.Hand
+  serverTCP.begin(); 
+  serverWeb.on("/", handleRoot);
+  serverWeb.on("/data", handleData);
+  serverWeb.begin();
+  
+  Serial.println("\nIP Static ESP32: " + WiFi.localIP().toString());
+}
 
-        btnHapusRiwayat.FlatStyle = FlatStyle.Flat
-        btnHapusRiwayat.FlatAppearance.BorderSize = 0
-        btnHapusRiwayat.BackColor = Color.FromArgb(220, 53, 69)
-        btnHapusRiwayat.ForeColor = Color.White
-        btnHapusRiwayat.Font = New Font("Segoe UI", 10, FontStyle.Bold)
-        btnHapusRiwayat.Cursor = Cursors.Hand
+// ==========================================
+// PROGRAM UTAMA LOOP (Siklus Super Cepat)
+// ==========================================
+void loop() {
+  serverWeb.handleClient(); 
+  bool wifiTersambung = (WiFi.status() == WL_CONNECTED);
 
-        txtIP.BackColor = Color.FromArgb(45, 45, 48)
-        txtIP.ForeColor = Color.White
-        txtIP.BorderStyle = BorderStyle.FixedSingle
-        txtIP.Font = New Font("Segoe UI", 11, FontStyle.Regular)
+  // Kelola Koneksi TCP Visual Basic
+  if (serverTCP.hasClient()) {
+    if (!vbClient || !vbClient.connected()) {
+      if (vbClient) vbClient.stop(); 
+      vbClient = serverTCP.available(); 
+    } else {
+      WiFiClient tolakKlien = serverTCP.available();
+      tolakKlien.stop();
+    }
+  }
+  bool vbTersambung = (vbClient && vbClient.connected());
 
-        With dgvHistory
-            .BackgroundColor = Color.FromArgb(45, 45, 48) 
-            .BorderStyle = BorderStyle.None
-            .EnableHeadersVisualStyles = False 
-            
-            .ColumnHeadersBorderStyle = DataGridViewHeaderBorderStyle.None
-            .ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(37, 37, 38)
-            .ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(0, 122, 204)
-            .ColumnHeadersDefaultCellStyle.Font = New Font("Segoe UI", 10, FontStyle.Bold)
-            .ColumnHeadersHeight = 35
-            
-            .DefaultCellStyle.BackColor = Color.FromArgb(45, 45, 48)
-            .DefaultCellStyle.ForeColor = Color.White
-            .DefaultCellStyle.SelectionBackColor = Color.FromArgb(0, 122, 204) 
-            .DefaultCellStyle.SelectionForeColor = Color.White
-            
-            .RowHeadersVisible = False 
-            .AllowUserToAddRows = False 
-            .GridColor = Color.FromArgb(60, 60, 60) 
-            .AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill 
-            .SelectionMode = DataGridViewSelectionMode.FullRowSelect 
-        End With
+  // 1. Membaca Sensor Suhu & Getaran
+  float bacaSuhu = dht.readTemperature();
+  if (!isnan(bacaSuhu)) suhu = bacaSuhu; 
+  bool bahayaSuhu = (suhu > BATAS_SUHU_KRITIS);
 
-        lblSuhuAngka.Font = New Font("Segoe UI", 36, FontStyle.Bold)
-        lblSuhuStatus.Font = New Font("Segoe UI", 14, FontStyle.Bold)
-        lblGetaranStatus.Font = New Font("Segoe UI", 14, FontStyle.Bold)
-    End Sub
+  int statusGetaran = digitalRead(VIB_PIN);
+  if (statusGetaran == HIGH) {
+    hitungAnomali++; hitungAman = 0;      
+    if (hitungAnomali >= 3) { statusAnomali = true; hitungAnomali = 3; }
+  } else { 
+    hitungAman++; hitungAnomali = 0;   
+    if (hitungAman >= 3) { statusAnomali = false; hitungAman = 3; }
+  }
 
-End Class
+  // 2. BURST SAMPLING VL53L0X: Ambil 10 data secepat mungkin saat ini juga!
+  long totalJarak = 0;
+  for (int i = 0; i < 10; i++) {
+    VL53L0X_RangingMeasurementData_t measure;
+    lox.rangingTest(&measure, false);
+    if (measure.RangeStatus != 4) { 
+      totalJarak += measure.RangeMilliMeter;
+    } else {
+      totalJarak += jarakRataRata; // Gunakan nilai sebelumnya jika pembacaan gagal/out of range
+    }
+  }
+  jarakRataRata = totalJarak / 10; // Hitung rata-rata langsung dari 10 tembakan cepat
+
+  // 3. Kirim Data ke VB via TCP INSTAN (Tanpa menunggu 1 detik!)
+  if (vbTersambung) {
+    String strSuhu = bahayaSuhu ? "PANAS BERBAHAYA" : "UDARA SEGAR";
+    String strGetar = statusAnomali ? "GETARAN BERANOMALI" : "GETARAN AMAN";
+    vbClient.println(String(suhu, 1) + "," + strSuhu + "," + strGetar + "," + String(jarakRataRata)); 
+  }
+
+  // 4. Kondisi Kritis (Layar Berkedip Invert)
+  bool kondisiKritis = (bahayaSuhu && statusAnomali);
+  if (kondisiKritis) {
+    if (millis() - waktuKedipTerakhir >= 1000) {
+      waktuKedipTerakhir = millis();
+      statusKedipLayar = !statusKedipLayar;
+      display.invertDisplay(statusKedipLayar); 
+    }
+  } else {
+    display.invertDisplay(false); 
+  }
+
+  // 5. Menggambar Layar OLED (Layout Padat dengan Jarak)
+  display.clearDisplay();
+  
+  // Baris 1: Suhu & Jarak Lantai
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Suhu:"); display.print(suhu, 1); display.print("C ");
+  display.print("D:"); display.print(jarakRataRata); display.print("mm");
+  
+  // Ikon Status Kanan Atas
+  display.drawBitmap(106, 0, vbTersambung ? icon_vb_ok : icon_vb_off, 8, 8, SSD1306_WHITE);
+  display.drawBitmap(118, 0, wifiTersambung ? icon_wifi_ok : icon_wifi_off, 8, 8, SSD1306_WHITE);
+
+  // Baris 2: Indikator Suhu & Emoji
+  if (bahayaSuhu) {
+    display.drawBitmap(0, 12, icon_api, 8, 8, SSD1306_WHITE);
+    display.setCursor(12, 12); display.print("Panas Berbahaya");
+  } else {
+    display.drawBitmap(0, 12, icon_daun, 8, 8, SSD1306_WHITE);
+    display.setCursor(12, 12); display.print("Udara Segar");
+  }
+
+  // Baris 3: Indikator Getaran
+  display.setCursor(0, 24);
+  display.print(statusAnomali ? "Getaran Beranomali" : "Getaran Aman");
+
+  display.display(); 
+  
+  // Delay sangat singkat (10ms) hanya untuk menjaga stabilitas memori jaringan WiFi ESP32
+  delay(10); 
+}
